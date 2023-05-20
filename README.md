@@ -1,2 +1,0 @@
-# Picasso
-Picasso NFT Platform
