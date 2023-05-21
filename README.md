@@ -1,9 +1,5 @@
 # Picasso NFT Platform
 
-```shell
-npx hardhat help
-npx hardhat test
-REPORT_GAS=true npx hardhat test
-npx hardhat node
-npx hardhat run scripts/deploy.ts
-```
+Picasso is a seamless and efficient platform for NFT publication. Support any user to publish their own creations and collections.
+
+Everything about NFT creation and distribution can be found in Picasso. Let's explore more possibilities about NFT together.
