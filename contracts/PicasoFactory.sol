@@ -5,7 +5,7 @@ pragma solidity ^0.8.9;
 
 // import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./NFT721/ONFT721.sol";
+import "./erc721a/contracts/ERC721A.sol";
 import "./operator-filter-registry/src/DefaultOperatorFilterer.sol";
 
 // Share configure
@@ -14,7 +14,7 @@ struct TShare {
     uint256 ratioPPM;
 }
 
-contract PicasoBase is ONFT721, DefaultOperatorFilterer {
+contract PicasoBase is ERC721A, Ownable, DefaultOperatorFilterer {
     // Mint price in sale period
     uint256 public _salePrice;
 
@@ -23,14 +23,12 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
 
     uint256 public platformBalance;
     uint256 public ownerBalance;
+    uint256 public collectorBalance;
 
     uint256 private _reserveQuantity;
 
     // Max number allow to mint
     uint256 public _maxSupply;
-
-    // The tokenId of the next token to be minted.
-    uint256 internal _currentIndex;
 
     // Presale and Publicsale start time
     uint256 public presaleStartTime;
@@ -52,9 +50,41 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
     // Platform fee ratio in PPM
     uint256 public platformFeePPM = 0;
 
+    // Super admin is able to set isForceRefundable flag to true in 7 days since the first token was minted in the public sale period or all tokens were minted in the presale period.
+    // When isForceRefundable is set to true, token holders can get a full refund in 7 days.
+    // Neither Creators nor platform is also not allowed to withdraw in 7 days when isForceRefundable is set to true.
+    uint256 public isForceRefundable = 0;
+    uint256 public forceRefundDeadline = 2 ** 32;
+
     // Is the contract paused
     uint256 public paused = 0;
-    
+
+    //event TokenMinted(address minter, uint256 tokenId , uint256 mintPrice, uint256 platformFee);
+
+    //event ContractDeployed(address sender, address contract_address, uint256 reserveQuantity, uint256 clubId);
+
+    // Mint Information
+    // mapping(tokenID => TMintInfO)
+    struct TMintInfo {
+        uint256 isPreMint;
+        uint256 isRefunded;
+        //address minter;
+        uint256 price;
+    }
+    mapping(uint256 => TMintInfo) public _mintInfo;
+
+    // Refund Times and Ratios
+    struct TRefundTime {
+        uint256 endTime; /// Refund is available before this time (and isRefundable == true). In unix timestamp.
+        uint256 ratioPPM; /// How much ratio can be refund
+    }
+
+    // Share list
+    TShare[] public _shareList;
+
+    // Refund Time List
+    TRefundTime[] public _refundTimeList;
+
     /**
     u256[0] =>  reserveQuantity
         [1] =>  maxSupply
@@ -74,28 +104,67 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
     constructor(
         string memory name_,
         string memory symbol_,
-        uint256 _minGasToTransfer, 
-        address _lzEndpoint,
-        uint256[] memory u256s
-    ) ONFT721(name_, symbol_, _minGasToTransfer, _lzEndpoint) {
+        uint256[] memory u256s,
+        address[] memory shareAddresses_,
+        uint256[] memory shareRatios_,
+        uint256[] memory refundTimes_,
+        uint256[] memory refundRatios_
+    ) ERC721A(name_, symbol_) {
         require(u256s[0] + u256s[2] <= u256s[1], "PN:maxSupply");
 
-        // 1. Deplay
+        // 1. Deplay and log the create event
         factory = msg.sender;
 
         _reserveQuantity = u256s[0];
         presaleMaxSupply = u256s[2];
         setPresaleTimes(u256s[4], u256s[5]);
         setSaleTimes(u256s[6], u256s[7]);
-        setMintPrice(u256s[9]); 
+        setMintPrice(u256s[9]);
         _maxSupply = u256s[1];
 
         transferOwnership(tx.origin);
 
+        //emit ContractDeployed(tx.origin, address(this), u256s[0], u256s[3]);
+
         /// 2. Reserve tokens for creator
         initReserve(u256s[0]);
 
-        /// 3. Setting mint limit for wallets
+        /// 3. Setting share list
+
+        // To reduce contract size, share list is no longer available
+        shareAddresses_;
+        shareRatios_;
+        // uint256 totalShareRatios = 0;
+        // for (uint256 i = 0; i < shareAddresses_.length; i++) {
+        //     TShare memory t;
+        //     t.owner = shareAddresses_[i];
+        //     t.ratioPPM = shareRatios_[i];
+
+        //     totalShareRatios += t.ratioPPM;
+
+        //     _shareList.push(t);
+        // }
+        // require(totalShareRatios <= 1 * 1000 * 1000, "PN:shareRatios of");
+
+        /// 4. Setting refund times
+        require(refundTimes_.length == refundRatios_.length, "PN:len mismatch");
+        uint256 oldEndTime = 0;
+        uint256 oldRatio = 1e9;
+        for (uint256 i = 0; i < refundTimes_.length; i++) {
+            TRefundTime memory t;
+            t.endTime = refundTimes_[i];
+            t.ratioPPM = refundRatios_[i];
+
+            require(t.endTime > oldEndTime, "PN:refundTimes inval");
+            require(t.ratioPPM < oldRatio, "PN:refundRatio inval");
+
+            oldEndTime = t.endTime;
+            oldRatio = t.ratioPPM;
+
+            _refundTimeList.push(t);
+        }
+
+        /// 5. Setting mint limit for wallets
         presaleMaxMintCountPerAddress = u256s[10];
         saleMaxMintCountPerAddress = u256s[11];
         unchecked {
@@ -107,7 +176,7 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
             }
         }
 
-        /// 4. Setting platform PPM
+        /// 6. Setting platform PPM
         platformFeePPM = PicasoFactory(factory).platformFeePPM();
     }
 
@@ -137,6 +206,7 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
     }
 
     // Minted token will be sent to minter
+    // sign_deadline, r, s, v is only require at presale perioid. These parameters are server-side signature data.
     function mint(
         address minter,
         uint256 mint_price,
@@ -173,7 +243,7 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
 
         /// Mint `count` number of tokens
         for (uint256 i = 0; i < count; i++) {
-            require(_currentIndex < _maxSupply, "PN:No more");
+            require(totalMinted() < _maxSupply, "PN:No more");
 
             if (isPresale == 1) {
                 requireMintSign(
@@ -196,6 +266,7 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
                     "PN:addr(A)"
                 );
             } else if (isSale == 1) {
+                //requireMintSign(minter, mint_price, sign_deadline, r, s, v);
 
                 saleMintCountByAddress[msg.sender]++;
                 require(
@@ -207,31 +278,128 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
                 revert("PN:NotSalePeriod");
             }
 
+            // 1. Mint it
             uint256 currentIndex = _currentIndex;
 
             _mint(minter, 1, "", false);
 
+            // 2. Send mint value to creator and platform and collectors
             uint256 platformGot = (mint_price * platformFeePPM) / 1e6;
-            uint256 ownerGot = mint_price - platformGot;
+            uint256 collectorGot = ((mint_price - platformGot) *
+                getCollectorTotalRatioPPM()) / 1e6;
+            uint256 ownerGot = mint_price - platformGot - collectorGot;
 
             platformBalance += platformGot;
+            collectorBalance += collectorGot;
             ownerBalance += ownerGot;
-            _currentIndex++;
+
+            // 4. Log events and other data
+            _mintInfo[currentIndex] = TMintInfo({
+                isPreMint: isPresale,
+                isRefunded: 0,
+                //minter: minter,
+                price: mint_price
+            });
+
+            //emit TokenMinted(minter, currentIndex, mint_price, platformGot);
         }
 
+        // Init 7-days refund time
+        if (isSale == 1 || _currentIndex == _maxSupply - 1) {
+            if (forceRefundDeadline == 2 ** 32) {
+                forceRefundDeadline = block.timestamp + 86400 * 7;
+            }
+        }
 
+        //  Mint finished successfully
     }
 
+    /// User request to refund
+    function refund(uint256 tokenID) public {
+        require(msg.sender == ownerOf(tokenID), "PN:owner");
+
+        /// 1. Get refund ratio
+        // If forceRefundable is true, holder can refund all. Otherwise holder can only refund before refund time
+        uint256 refundRatioPPM = 0;
+        if (isForceRefundable == 1) {
+            refundRatioPPM = 1e6;
+        } else {
+            for (uint256 i = 0; i < _refundTimeList.length; i++) {
+                if (block.timestamp < _refundTimeList[i].endTime) {
+                    refundRatioPPM = _refundTimeList[i].ratioPPM;
+                    break;
+                }
+            }
+        }
+        require(refundRatioPPM > 0, "PN:refundNotAvail");
+
+        /// 2. Get mint info and check if this token is refundable
+        TMintInfo storage mintInfo = _mintInfo[tokenID];
+
+        require(mintInfo.isRefunded == 0, "PN:refunded");
+
+        /// 3. Caculate the refundable value
+        uint256 refundValue = (mintInfo.price * refundRatioPPM) / 1e6;
+
+        /// 4. Do refund
+        uint256 platformReturn = (refundValue * platformFeePPM) / 1e6;
+        uint256 collectorReturn = ((refundValue - platformReturn) *
+            getCollectorTotalRatioPPM()) / 1e6;
+        uint256 ownerReturn = refundValue - platformReturn - collectorReturn;
+
+        platformBalance -= platformReturn;
+        collectorBalance -= collectorReturn;
+        ownerBalance -= ownerReturn;
+
+        transferFrom(msg.sender, this.owner(), tokenID);
+
+        mintInfo.isRefunded = 1;
+
+        payable(msg.sender).transfer(refundValue);
+    }
+
+    // Send shares to share holders and owner
     function collect() public onlyOwner {
+        /// 1. Check if collect is open
+        requireCollectable();
+
+        /// 2. Find the collector and transfer
+
+        // To reduce solidity size, collector share is no longer available
+        // uint256 b = collectorBalance;
+        // uint256 totalRatioPPM = getCollectorTotalRatioPPM();
+        // for (uint256 i = 0; i < _shareList.length; i++) {
+        //     uint256 collectValue = b * _shareList[i].ratioPPM / totalRatioPPM;
+        //     collectorBalance -= collectValue;
+        //     payable(_shareList[i].owner).transfer(collectValue);
+        // }
+
+        /// 3. send balance to owner
         uint256 oBalance = ownerBalance;
         ownerBalance = 0;
         payable(owner()).transfer(oBalance);
     }
 
+    // Platform (ManeStudio) collect it's shares
     function platformCollect(address to) public onlyFactoryOwner {
+        requireCollectable();
+
         uint256 b = platformBalance;
         platformBalance = 0;
         payable(to).transfer(b);
+    }
+
+    function requireCollectable() internal view {
+        for (uint256 i = 0; i < _refundTimeList.length; i++) {
+            require(
+                block.timestamp > _refundTimeList[i].endTime,
+                "PN:refundDeadline"
+            );
+        }
+
+        /// Not allow collect in 7 days. See forceRefundDeadline for more detail
+        require(block.timestamp > forceRefundDeadline, "PN:7dLimit");
+        require(isForceRefundable == 0, "PN:forceRefund");
     }
 
     /// If signagure is not valid, throw exception and stop
@@ -265,6 +433,10 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
         return keccak256(abi.encodePacked(minter, price, count, deadline));
     }
 
+    function totalMinted() public view returns (uint256) {
+        return _totalMinted();
+    }
+
     function _baseURI() internal view override returns (string memory) {
         string memory factoryBaseURI = PicasoFactory(factory).factoryBaseURI();
         return
@@ -286,12 +458,28 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
         presaleMaxSupply = max_;
     }
 
+    function adminSetRefund(uint256 is_refundable_) public onlyFactoryOwner {
+        require(block.timestamp < forceRefundDeadline, "PN:time");
+        isForceRefundable = is_refundable_;
+    }
+
     function setPresaleMaxMintCountPerAddress(uint256 max_) public onlyOwner {
         presaleMaxMintCountPerAddress = max_;
     }
 
     function setSaleMaxMintCountPerAddress(uint256 max_) public onlyOwner {
         saleMaxMintCountPerAddress = max_;
+    }
+
+    function getCollectorTotalRatioPPM() internal view returns (uint256) {
+        uint256 ratioPPM = 0;
+        for (uint256 i = 0; i < _shareList.length; i++) {
+            ratioPPM += _shareList[i].ratioPPM;
+        }
+
+        require(ratioPPM <= 1e6, "PN:ratio");
+
+        return ratioPPM;
     }
 
     function setPresaleTimes(
@@ -322,12 +510,20 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
         }
     }
 
+    function getShareListLength() public view returns (uint256) {
+        return _shareList.length;
+    }
+
+    function getRefundTimeListLength() public view returns (uint256) {
+        return _refundTimeList.length;
+    }
+
     function setPaused(uint256 is_pause) public onlyOwner {
         paused = is_pause;
     }
 
     function destroy() public onlyOwner {
-        // require(_currentIndex == _reserveQuantity, "PN:notAllow");
+        require(_currentIndex == _reserveQuantity, "PN:notAllow");
         selfdestruct(payable(this.owner()));
     }
 
@@ -339,6 +535,45 @@ contract PicasoBase is ONFT721, DefaultOperatorFilterer {
     modifier whenNotPaused() {
         require(paused == 0, "PN:paused");
         _;
+    }
+
+    function setApprovalForAll(
+        address operator,
+        bool approved
+    ) public override onlyAllowedOperatorApproval(operator) {
+        super.setApprovalForAll(operator, approved);
+    }
+
+    function approve(
+        address operator,
+        uint256 tokenId
+    ) public override onlyAllowedOperatorApproval(operator) {
+        super.approve(operator, tokenId);
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public override onlyAllowedOperator(from) {
+        super.transferFrom(from, to, tokenId);
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public override onlyAllowedOperator(from) {
+        super.safeTransferFrom(from, to, tokenId);
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory data
+    ) public override onlyAllowedOperator(from) {
+        super.safeTransferFrom(from, to, tokenId, data);
     }
 
     function setOpenseaEnforcement(uint256 isEnforcement) public onlyOwner {
@@ -370,7 +605,7 @@ contract SignAndOwnable is Ownable {
 }
 
 contract PicasoFactory is SignAndOwnable {
-    uint256 public platformFeePPM = 50 * 1e3;
+    uint256 public platformFeePPM = 100 * 1e3;
 
     string public factoryBaseURI = "";
 
@@ -384,11 +619,11 @@ contract PicasoFactory is SignAndOwnable {
     function deploy(
         string memory name_,
         string memory symbol_,
-        uint256 _minGasToTransfer, 
-        address _lzEndpoint,
         uint256[] memory u256s,
         address[] memory shareAddresses_,
         uint256[] memory shareRatios_,
+        uint256[] memory refundEndTimes_,
+        uint256[] memory refundRatios_,
         uint8 v,
         bytes32 r,
         bytes32 s
@@ -411,9 +646,11 @@ contract PicasoFactory is SignAndOwnable {
         PicasoBase c = new PicasoBase(
             name_,
             symbol_,
-            _minGasToTransfer,
-            _lzEndpoint,
-            u256s
+            u256s,
+            shareAddresses_,
+            shareRatios_,
+            refundEndTimes_,
+            refundRatios_
         );
         //contracts.push(address(c));
         clubMap[u256s[3]] = address(c);
